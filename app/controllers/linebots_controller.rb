@@ -1,8 +1,9 @@
-class LinebotsController < ApplicationController
+
+class RakutensController < ApplicationController
     require 'line/bot'
-  
+
     # callbackアクションのCSRFトークン認証を無効
-    protect_from_forgery :except => [:callback]
+    protect_from_forgery except: [:callback]
   
     def callback
       body = request.body.read
@@ -18,9 +19,9 @@ class LinebotsController < ApplicationController
           when Line::Bot::Event::MessageType::Text
             # 入力した文字をinputに格納
             input = event.message['text']
-            # search_and_create_messageメソッド内で、AmazonAPIを用いた商品検索、メッセージの作成を行う
-            messages = search_and_create_messages(input)
-            client.reply_message(event['replyToken'], messages)
+            # search_and_create_messageメソッド内で、楽天APIを用いた商品検索、メッセージの作成を行う
+            message = search_and_create_message(input)
+            client.reply_message(event['replyToken'], message)
           end
         end
       end
@@ -36,56 +37,41 @@ class LinebotsController < ApplicationController
       end
     end
   
-    def search_and_create_messages(input)
-      # デバックログを出力するために記述(動作には影響なし)
-      Amazon::Ecs.debug = true
-      # AmazonAPIの仕様上、ALLジャンルからのランキングの取得はできないので、
-      # ALLジャンルで商品検索→最初に出力された商品のジャンルを取得し、
-      # そのジャンル内でのランキングを再度取得する。
-      # つまり、2度AmazonAPIを利用している。
-      res1 = Amazon::Ecs.item_search(
-        input, # キーワード指定
-        search_index: 'All', # 抜きたいジャンルを指定
-        response_group: 'BrowseNodes', # 取得したいジャンルIDはBrowseNodesグループに含まれているのでここで指定する
-        country: 'jp'
-      )
-      # ジャンルIDを取得する
-      # Amazonの公式ドキュメント（https://images-na.ssl-images-amazon.com/images/G/09/associates/paapi/dg/index.html）に
-      # 各要素、取得するために使用する親要素の一覧が掲載されている
-      browse_node_no = res1.items.first.get('BrowseNodes/BrowseNode/BrowseNodeId')
-      res2 = Amazon::Ecs.item_search(
-        input,
-        browse_node: browse_node_no, # 取得したジャンルID内でのランキングを取得する
-        response_group: 'ItemAttributes, Images, Offers',
-        country: 'jp',
-        sort: 'salesrank' # ソート順を売上順に指定することでランキングとする
-      )
-      make_reply_content(res2)
+    def search_and_create_message(input)
+      RakutenWebService.configuration do |c|
+        c.application_id = ENV['RAKUTEN_APPID']
+        c.affiliate_id = ENV['RAKUTEN_AFID']
+      end
+      # 楽天の商品検索APIで画像がある商品の中で、入力値で検索して上から3件を取得する
+      # 商品検索+ランキングでの取得はできないため標準の並び順で上から3件取得する
+      res = RakutenWebService::Ichiba::Item.search(keyword: input, hits: 3, imageFlag: 1)
+      items = []
+      # 取得したデータを使いやすいように配列に格納し直す
+      items = res.map{|item| item}
+      make_reply_content(items)
     end
-    # LINE公式のFlex Message Simulator(https://developers.line.me/console/fx/)でShoppingのテーマをベースに作成
-    # 細かい仕様はLINE公式ドキュメント(https://developers.line.me/ja/docs/messaging-api/using-flex-messages/)ご参照
-    def make_reply_content(res2)
+  
+    def make_reply_content(items)
       {
-        "type": "flex",
-        "altText": "This is a Flex Message",
+        "type": 'flex',
+        "altText": 'This is a Flex Message',
         "contents":
         {
-          "type": "carousel",
+          "type": 'carousel',
           "contents": [
-            make_part(res2.items[0], 1),
-            make_part(res2.items[1], 2),
-            make_part(res2.items[2], 3)
+            make_part(items[0]),
+            make_part(items[1]),
+            make_part(items[2])
           ]
         }
       }
     end
   
-    def make_part(item, rank)
-      title = item.get('ItemAttributes/Title')
-      # 価格は2箇所から取得しており、1番目の方にデータがない場合は2番目のデータを使う
-      price = item.get('ItemAttributes/ListPrice/FormattedPrice') || item.get('OfferSummary/LowestNewPrice/FormattedPrice')
-      url = bitly_shorten(item.get('DetailPageURL'))
-      image = item.get('LargeImage/URL')
+    def make_part(item)
+      title = item['itemName']
+      price = item['itemPrice'].to_s + '円'
+      url = item['itemUrl']
+      image = item['mediumImageUrls'].first
       {
         "type": "bubble",
         "hero": {
@@ -101,14 +87,6 @@ class LinebotsController < ApplicationController
           "layout": "vertical",
           "spacing": "sm",
           "contents": [
-            {
-              "type": "text",
-              "text": "#{rank}位",
-              "wrap": true,
-              "margin": "md",
-              "color": "#ff5551",
-              "flex": 0
-            },
             {
               "type": "text",
               "text": title,
@@ -128,8 +106,7 @@ class LinebotsController < ApplicationController
                   "flex": 0
                 }
               ]
-            }
-          ]
+            }                      ]
         },
         "footer": {
           "type": "box",
